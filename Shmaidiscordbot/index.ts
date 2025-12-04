@@ -1,16 +1,17 @@
 // index.ts
-import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
+import { Client, GatewayIntentBits, TextChannel, Attachment } from 'discord.js';
 import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
+import FormData from 'form-data'; // Explicitly import FormData
 
 dotenv.config();
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // Original webhook for forwarding messages
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL; // New: Webhook URL for n8n to receive commands from Discord
-const PREFIX = process.env.COMMAND_PREFIX || '!'; // Prefix for commands, e.g., !run
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+const PREFIX = process.env.COMMAND_PREFIX || '!';
 const PORT = process.env.PORT || 3000;
 
 if (!DISCORD_TOKEN || !N8N_WEBHOOK_URL) {
@@ -18,7 +19,6 @@ if (!DISCORD_TOKEN || !N8N_WEBHOOK_URL) {
   process.exit(1);
 }
 
-// Set up Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -31,28 +31,28 @@ client.once('ready', () => {
   console.log(`Logged in as ${client.user?.tag} on Railway`);
 });
 
-// Listen for new messages from Discord
-// Inside index.ts – replace the old messageCreate event
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // Check if message has attachments (audio, video, image, etc.)
   if (message.attachments.size > 0) {
     for (const attachment of message.attachments.values()) {
       try {
-        // Download the file as a buffer
         const response = await fetch(attachment.url);
+        if (!response.ok) {
+          console.error(`Failed to fetch attachment: ${attachment.name} - ${response.status} ${response.statusText}`);
+          message.react('❌');
+          continue; // Skip to the next attachment
+        }
+
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
 
-        // Prepare form data (this is what n8n expects for real files)
         const formData = new FormData();
         formData.append('file', buffer, {
           filename: attachment.name,
           contentType: attachment.contentType || 'application/octet-stream',
         });
 
-        // Add useful metadata
         formData.append('discord_user', message.author.username);
         formData.append('user_id', message.author.id);
         formData.append('channel_id', message.channelId);
@@ -61,14 +61,19 @@ client.on('messageCreate', async (message) => {
         formData.append('file_size', attachment.size.toString());
         formData.append('uploaded_at', new Date().toISOString());
 
-        // Send to n8n webhook
-        await fetch(N8N_WEBHOOK_URL, {
+        const n8nResponse = await fetch(N8N_WEBHOOK_URL, {
           method: 'POST',
-          body: formData,
+          body: formData as any, // FormData is not directly compatible with fetch's body type
         });
 
+        if (!n8nResponse.ok) {
+          console.error(`n8n responded with error: ${n8nResponse.status} ${n8nResponse.statusText}`);
+          message.react('❌');
+          continue; // Skip to the next attachment
+        }
+
         console.log(`Sent file to n8n: ${attachment.name}`);
-        message.react('✅'); // Optional: confirm in Discord
+        message.react('✅');
       } catch (error) {
         console.error('Failed to forward file:', error);
         message.react('❌');
@@ -76,41 +81,38 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // Optional: Still handle text commands like !run if you want
-  if (message.content.startsWith('!')) {
-    // ... your existing command code
-  }
-});
-
-  // Original: Forward all messages to WEBHOOK_URL (optional, keep if needed)
   if (WEBHOOK_URL) {
-    const data = {
-      type: 'message',
-      author: message.author.username,
-      content: message.content,
-      channelId: message.channelId,
-      attachments: message.attachments.map((attachment) => attachment.url),
-    };
-
     try {
-      await fetch(WEBHOOK_URL, {
+      const data = {
+        type: 'message',
+        author: message.author.username,
+        content: message.content,
+        channelId: message.channelId,
+        attachments: message.attachments.map((attachment: Attachment) => attachment.url),
+      };
+
+      const webhookResponse = await fetch(WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-      console.log('Message forwarded to original webhook');
+
+      if (!webhookResponse.ok) {
+        console.error(`Webhook responded with error: ${webhookResponse.status} ${webhookResponse.statusText}`);
+      } else {
+        console.log('Message forwarded to original webhook');
+      }
     } catch (error) {
       console.error('Error forwarding message:', error);
     }
   }
 
-  // New: Handle commands starting with PREFIX, e.g., !run <payload>
   if (message.content.startsWith(PREFIX)) {
     const args = message.content.slice(PREFIX.length).trim().split(/ +/);
     const command = args.shift()?.toLowerCase();
 
     if (command === 'run') {
-      const payload = args.join(' '); // The rest is the payload for n8n
+      const payload = args.join(' ');
       if (!payload) {
         return message.reply('Please provide a payload for the command, e.g., !run your data here');
       }
@@ -136,7 +138,7 @@ client.on('messageCreate', async (message) => {
           console.log('Command sent to n8n successfully');
           message.reply('Command executed and sent to n8n! Check the workflow for results.');
         } else {
-          console.error('n8n responded with error:', response.status);
+          console.error(`n8n responded with error: ${response.status} ${response.statusText}`);
           message.reply('Error sending command to n8n. Try again later.');
         }
       } catch (error) {
@@ -149,14 +151,13 @@ client.on('messageCreate', async (message) => {
 
 client.login(DISCORD_TOKEN);
 
-// Set up Express server to receive POST requests (e.g., from n8n) for sending messages/files back to Discord
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(express.json());
 
 app.post('/send', upload.array('files'), async (req, res) => {
-  const { channelId, content, mentionUserId } = req.body; // Added optional mentionUserId for replies
+  const { channelId, content, mentionUserId } = req.body;
   const files = req.files as Express.Multer.File[];
 
   if (!channelId) {
@@ -164,10 +165,44 @@ app.post('/send', upload.array('files'), async (req, res) => {
   }
 
   try {
-    const channel = (await client.channels.fetch(channelId)) as TextChannel;
-    if (!channel || channel.type !== 0) { // 0 is TextChannel
+    const channel = await client.channels.fetch(channelId) as TextChannel;
+    if (!channel || channel.type !== 0) {
       return res.status(404).json({ error: 'Invalid channel' });
     }
+
+    const attachments = files?.map((file) => ({
+      attachment: file.buffer,
+      name: file.originalname,
+    })) || [];
+
+    let sendContent = content;
+    if (mentionUserId) {
+      try {
+        await client.users.fetch(mentionUserId); // Validate user ID before mentioning
+        sendContent = `<@${mentionUserId}> ${content}`;
+      } catch (userError) {
+        console.error(`Invalid mentionUserId: ${mentionUserId}`, userError);
+        sendContent = `Invalid User Mentioned: ${content}`; // Or handle it differently
+      }
+    }
+
+    await channel.send({ content: sendContent, files: attachments });
+    res.json({ success: true, message: 'Response sent to Discord' });
+  } catch (error) {
+    console.error('Error sending response:', error);
+    res.status(500).json({ error: 'Failed to send response to Discord' });
+  }
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT} (Railway-ready)`);
+});
+
+
 
     const attachments = files?.map((file) => ({
       attachment: file.buffer,

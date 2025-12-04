@@ -3,7 +3,7 @@ import { Client, GatewayIntentBits, TextChannel, Attachment } from 'discord.js';
 import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
-import dotenv from 'dotenv';
+import dotenv.config(); from 'dotenv';
 import FormData from 'form-data'; // Explicitly import FormData
 
 dotenv.config();
